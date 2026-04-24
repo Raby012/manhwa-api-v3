@@ -78,5 +78,11 @@ async function searchAndGetChapters(title) {
     
   } catch (e) {
     console.error("[MANGANATO] Search Error:", e.message);
-    return
+    return []; // FIXED
   }
+}
+
+module.exports = {
+  searchAndGetChapters,
+  getChapters
+};
