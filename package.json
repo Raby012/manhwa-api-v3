@@ -1,5 +1,5 @@
 {
-  "name": "manhwa-api2",
+  "name": "manhwa-api",
   "version": "1.0.0",
   "description": "Custom Manhwa API V2",
   "main": "index.js",
