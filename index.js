@@ -1,7 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const redis = require('redis'); // ADDED: The Redis Library
+const redis = require('redis');
+const { MongoClient } = require('mongodb'); // ADDED: MongoDB Library
 
 const anilist = require('./src/metadata/anilist'); 
 const mapper = require('./src/core/mapper');
@@ -18,82 +19,114 @@ app.use(express.json());
 // REDIS CLOUD CONNECTION
 // ==========================================
 let redisClient = null;
-
 (async () => {
-  // It looks for the REDIS_URL you saved in Render's Environment Variables
   if (process.env.REDIS_URL) {
-    redisClient = redis.createClient({ url: process.env.REDIS_URL });
-    redisClient.on('error', (err) => console.log('Redis Client Error:', err));
-    await redisClient.connect();
-    console.log('✅ Connected to Redis Cloud Successfully!');
-  } else {
-    console.log('⚠️ No REDIS_URL found in Environment Variables. Running without Redis.');
+    try {
+      redisClient = redis.createClient({ url: process.env.REDIS_URL });
+      redisClient.on('error', (err) => console.log('Redis Client Error:', err.message));
+      await redisClient.connect();
+      console.log('✅ Connected to Redis Cloud Successfully!');
+    } catch(e) { console.error("Redis Failed:", e.message) }
   }
 })();
 
-// Helper function to check Cache before doing heavy scraping
 async function checkCache(req, res, next) {
-  if (!redisClient) return next(); // Skip if Redis isn't connected
-  
-  const key = req.originalUrl;
+  if (!redisClient) return next();
   try {
-    const cachedData = await redisClient.get(key);
-    if (cachedData) {
-      console.log(`[CACHE HIT] Loaded ${key} instantly from Redis.`);
-      return res.json(JSON.parse(cachedData));
-    }
-    next(); // If not in cache, continue to normal route
-  } catch (err) {
+    const cachedData = await redisClient.get(req.originalUrl);
+    if (cachedData) return res.json(JSON.parse(cachedData));
     next();
-  }
+  } catch (err) { next(); }
 }
 
-// Helper function to save to Cache
-async function saveToCache(key, data, expirationInSeconds = 600) {
-  if (redisClient) {
-    await redisClient.setEx(key, expirationInSeconds, JSON.stringify(data));
-  }
+async function saveToCache(key, data, exp = 600) {
+  if (redisClient) await redisClient.setEx(key, exp, JSON.stringify(data));
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', message: 'ManhwaHub V2 Core Running (with Redis)' }));
+// ==========================================
+// MONGODB CONNECTION & USER ROUTES
+// ==========================================
+let db = null;
+(async () => {
+  if (process.env.MONGO_URI) {
+    try {
+      const mongoClient = new MongoClient(process.env.MONGO_URI);
+      await mongoClient.connect();
+      db = mongoClient.db('manhwahub'); // Creates a database named 'manhwahub'
+      console.log('✅ MongoDB Database Connected Successfully!');
+    } catch(e) { console.error("❌ MongoDB Failed:", e.message) }
+  } else {
+      console.log('⚠️ No MONGO_URI found in Environment Variables.');
+  }
+})();
+
+// Route to Save Reading History
+app.post('/api/user/history', async (req, res) => {
+  if (!db) return res.status(500).json({ error: "Database not connected" });
+  
+  const { userId, mangaId, title, cover, chapterId, chapterNumber } = req.body;
+  if (!userId || !mangaId) return res.status(400).json({ error: "Missing data" });
+
+  try {
+    const historyCollection = db.collection('history');
+    
+    // Upsert: If the user already read this manga, update the chapter. If not, create new entry.
+    await historyCollection.updateOne(
+      { userId, mangaId }, 
+      { $set: { title, cover, chapterId, chapterNumber, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    
+    res.json({ status: "success", message: "History saved" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Route to Get Reading History
+app.get('/api/user/history/:userId', async (req, res) => {
+  if (!db) return res.status(500).json({ error: "Database not connected" });
+  try {
+    const history = await db.collection('history')
+                            .find({ userId: req.params.userId })
+                            .sort({ updatedAt: -1 })
+                            .toArray();
+    res.json(history);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ==========================================
-// CACHED ROUTES
-// Notice we added 'checkCache' to these routes!
+// METADATA ROUTES
 // ==========================================
-app.get('/api/home', checkCache, async (req, res) => {
-  const data = await anilist.getHomepage();
-  await saveToCache(req.originalUrl, data, 600); // Cache for 10 minutes
-  res.json(data);
-});
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'ManhwaHub V2 Core Running' }));
+app.get('/api/home', checkCache, async (req, res) => { const data = await anilist.getHomepage(); await saveToCache(req.originalUrl, data, 300); res.json(data); });
+app.get('/api/latest/:page', checkCache, async (req, res) => { const data = await anilist.categoryFetch(req.params.page, 'latest'); await saveToCache(req.originalUrl, data, 600); res.json(data); });
+app.get('/api/all/:page', checkCache, async (req, res) => { const data = await anilist.categoryFetch(req.params.page, 'popular'); await saveToCache(req.originalUrl, data, 600); res.json(data); });
+app.get('/api/trending/:page', checkCache, async (req, res) => { const data = await anilist.categoryFetch(req.params.page, 'popular'); await saveToCache(req.originalUrl, data, 600); res.json(data); });
+app.get('/api/manhwa/:page', checkCache, async (req, res) => { const data = await anilist.categoryFetch(req.params.page, 'popular', 'manhwa'); await saveToCache(req.originalUrl, data, 600); res.json(data); });
+app.get('/api/manhua/:page', checkCache, async (req, res) => { const data = await anilist.categoryFetch(req.params.page, 'popular', 'manhua'); await saveToCache(req.originalUrl, data, 600); res.json(data); });
+app.get('/api/manga/:page', checkCache, async (req, res) => { const data = await anilist.categoryFetch(req.params.page, 'popular', 'manga'); await saveToCache(req.originalUrl, data, 600); res.json(data); });
+app.get('/api/browse/:page', async (req, res) => { const filters = { type: req.query.type || '', status: req.query.status || '', sort: req.query.sort || 'popular', genre: req.query.genre || '' }; res.json(await anilist.browse(req.params.page || 1, filters)); });
+app.get('/api/search/:query', async (req, res) => res.json(await anilist.searchManga(req.params.query, req.query.page || 1)));
+app.get('/api/search', async (req, res) => res.json(await anilist.searchManga(req.query.q || req.query.query || '', req.query.page || 1)));
+app.get('/api/info/:id', checkCache, async (req, res) => { const data = await anilist.getInfo(req.params.id); await saveToCache(req.originalUrl, data, 86400); res.json(data); });
 
-app.get('/api/latest/:page', checkCache, async (req, res) => {
-  const data = await anilist.categoryFetch(req.params.page, 'latest');
-  await saveToCache(req.originalUrl, data, 600);
-  res.json(data);
-});
-
-app.get('/api/info/:id', checkCache, async (req, res) => {
-  const data = await anilist.getInfo(req.params.id);
-  await saveToCache(req.originalUrl, data, 86400); // Cache info for 24 hours
-  res.json(data);
-});
-
-// The Heavy Multi-Provider Chapter Fetcher
+// ==========================================
+// CHAPTER ROUTES
+// ==========================================
 app.get('/api/chapters/:anilistId', checkCache, async (req, res) => {
   const anilistId = req.params.anilistId;
   const mappings = await mapper.getProviderIds(anilistId);
-  
   let finalChapters =[];
 
   if (mappings.mangadex) finalChapters = await mangadex.getChapters(mappings.mangadex);
 
   if (finalChapters.length < 15) {
-      console.log(`[WATERFALL] MangaDex missing chapters. Trying Manganato...`);
       let natoChapters =[];
-      if (mappings.manganato) {
-          natoChapters = await manganato.getChapters(mappings.manganato);
-      } else {
+      if (mappings.manganato) natoChapters = await manganato.getChapters(mappings.manganato);
+      else {
           const info = await anilist.getInfo(anilistId);
           const searchTitle = info.alt_titles[0] || info.page;
           if (searchTitle) natoChapters = await manganato.searchAndGetChapters(searchTitle);
@@ -102,7 +135,6 @@ app.get('/api/chapters/:anilistId', checkCache, async (req, res) => {
   }
 
   if (finalChapters.length < 15 && mappings.comick) {
-      console.log(`[WATERFALL] Manganato failed. Trying ComicK...`);
       const ckChapters = await comick.getChapters(mappings.comick);
       if (ckChapters.length > finalChapters.length) finalChapters = ckChapters;
   }
@@ -111,39 +143,24 @@ app.get('/api/chapters/:anilistId', checkCache, async (req, res) => {
   finalChapters.forEach((c, i) => c.chapter_index = i + 1);
 
   const responseData = { ch_list: finalChapters, total_chapters: finalChapters.length, source_used: finalChapters.length > 0 ? finalChapters[0].provider : 'None' };
-  
-  // Cache the chapter list for 15 minutes
   await saveToCache(req.originalUrl, responseData, 900); 
-  
   res.json(responseData);
 });
 
-// ==========================================
-// UNCACHED ROUTES (Search & Reading)
-// ==========================================
-app.get('/api/search/:query', async (req, res) => res.json(await anilist.searchManga(req.params.query, req.query.page || 1)));
-app.get('/api/search', async (req, res) => res.json(await anilist.searchManga(req.query.q || req.query.query || '', req.query.page || 1)));
-app.get('/api/browse/:page', async (req, res) => {
-  const filters = { type: req.query.type || '', status: req.query.status || '', sort: req.query.sort || 'popular', genre: req.query.genre || '' };
-  res.json(await anilist.browse(req.params.page || 1, filters));
-});
 app.get('/api/chapter/:slug', async (req, res) => res.json(await reader.getPages(req.params.slug)));
 
-// Image Proxy
+// ==========================================
+// IMAGE PROXY
+// ==========================================
 app.get('/api/proxy/image', async (req, res) => {
   const imageUrl = req.query.url;
   if (!imageUrl) return res.status(400).send('No image URL provided');
   try {
-    const response = await axios.get(imageUrl, {
-      responseType: 'arraybuffer',
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://manganato.com/' }
-    });
+    const response = await axios.get(imageUrl, { responseType: 'arraybuffer', headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://manganato.com/' } });
     res.setHeader('Content-Type', response.headers['content-type']);
     res.setHeader('Cache-Control', 'public, max-age=86400'); 
     res.send(response.data);
-  } catch (error) {
-    res.status(500).send('Failed to load image');
-  }
+  } catch (error) { res.status(500).send('Failed to load image'); }
 });
 
 const PORT = process.env.PORT || 3000;
